@@ -6,9 +6,10 @@ from config import DTrOCRConfig
 from processor import DTrOCRProcessor
 from data import DTrOCRLMHeadModelOutput, DTrOCRModelOutput, DTrOCRProcessorOutput
 
-from transformers.models.vit.modeling_vit import ViTPatchEmbeddings
-from transformers.generation.logits_process import LogitsProcessorList
+# --- CHANGE: Import Qwen2-VL instead of ViT ---
+from transformers import Qwen2VLForConditionalGeneration
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model
+from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer
@@ -20,47 +21,17 @@ from transformers.generation.stopping_criteria import (
     StopStringCriteria,
 )
 
-class DTrOCRPredictionNetwork(nn.Module):
-    """Prediction Network for RNNT: Models text dependencies using an RNN."""
-    def __init__(self, config: DTrOCRConfig):
-        super().__init__()
-        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.rnn = nn.LSTM(
-            input_size=config.hidden_size,
-            hidden_size=config.hidden_size,
-            num_layers=2,
-            batch_first=True,
-            dropout=config.resid_pdrop
-        )
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-
-    def forward(self, input_ids: torch.LongTensor, hidden_state: Optional[Tuple[Tensor, Tensor]] = None):
-        embedded = self.embedding(input_ids)
-        if hidden_state is None:
-            output, hidden = self.rnn(embedded)
-        else:
-            output, hidden = self.rnn(embedded, hidden_state)
-        output = self.layer_norm(output)
-        return output, hidden
-
-class DTrOCRJointNetwork(nn.Module):
-    """Joint Network for RNNT: Combines encoder and prediction network outputs."""
-    def __init__(self, config: DTrOCRConfig):
-        super().__init__()
-        self.linear1 = nn.Linear(config.hidden_size * 2, config.hidden_size)
-        self.linear2 = nn.Linear(config.hidden_size, config.vocab_size)
-        self.activation = nn.Tanh()
-
-    def forward(self, encoder_output: Tensor, prediction_output: Tensor):
-        combined = torch.cat([encoder_output, prediction_output], dim=-1)
-        hidden = self.activation(self.linear1(combined))
-        logits = self.linear2(hidden)
-        return logits
-
 class DTrOCRModel(nn.Module):
     def __init__(self, config: DTrOCRConfig):
         super().__init__()
-        self.patch_embeddings = ViTPatchEmbeddings(config)
+        # --- CHANGE: Replace ViTPatchEmbeddings with Qwen2-VL vision encoder ---
+        qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(config.vit_hf_model)
+        self.patch_embeddings = qwen_model.vision_tower  # Extract the vision encoder (ViT-based)
+        self.vision_output_dim = 1152  # Qwen2-VL-2B's vision encoder output dimension (from model config)
+
+        # Add a projection layer to match GPT-2's hidden size
+        self.projection = nn.Linear(self.vision_output_dim, config.hidden_size)
+
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.positional_embedding = nn.Embedding(config.max_position_embeddings, config.hidden_size)
 
@@ -89,7 +60,15 @@ class DTrOCRModel(nn.Module):
         else:
             past_length = past_key_values[0][0].size(-2)
 
-        patch_embeddings = self.patch_embeddings(pixel_values) if past_length == 0 else None
+        # --- CHANGE: Process pixel values with Qwen2-VL vision encoder ---
+        if past_length == 0:
+            with torch.no_grad():  # Freeze vision encoder
+                patch_embeddings = self.patch_embeddings(pixel_values)  # Shape: (batch, num_patches, vision_output_dim)
+            # Project to GPT-2's hidden size
+            patch_embeddings = self.projection(patch_embeddings)  # Shape: (batch, num_patches, hidden_size)
+        else:
+            patch_embeddings = None
+
         token_embeddings = self.token_embedding(input_ids)
 
         if patch_embeddings is not None:
@@ -156,8 +135,7 @@ class DTrOCRLMHeadModel(nn.Module):
         super().__init__()
         self.config = config
         self.transformer = DTrOCRModel(config)
-        self.prediction_network = DTrOCRPredictionNetwork(config)
-        self.joint_network = DTrOCRJointNetwork(config)
+        self.language_model_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         image_size, patch_size = config.image_size, config.patch_size
         self.image_embedding_length = int((image_size[0] / patch_size[0]) * (image_size[1] / patch_size[1]))
@@ -171,9 +149,7 @@ class DTrOCRLMHeadModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         labels: Optional[torch.LongTensor] = None,
-        prediction_hidden: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> DTrOCRLMHeadModelOutput:
-        # Encoder (ViT + GPT-2 layers)
         transformer_output = self.transformer(
             pixel_values=pixel_values,
             input_ids=input_ids,
@@ -182,21 +158,15 @@ class DTrOCRLMHeadModel(nn.Module):
             attention_mask=attention_mask,
             use_cache=use_cache
         )
-        encoder_output = transformer_output.hidden_states
-
-        # Prediction Network (RNN)
-        prediction_output, prediction_hidden = self.prediction_network(input_ids, prediction_hidden)
-
-        # Joint Network
-        logits = self.joint_network(encoder_output, prediction_output)
+        logits = self.language_model_head(transformer_output.hidden_states)
 
         loss, accuracy = None, None
         if labels is not None:
             labels = labels.to(logits.device)
+
             shift_logits = logits[..., self.image_embedding_length:-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            # RNNT Loss (simplified; typically requires a custom RNNT loss implementation)
             loss_fct = nn.CrossEntropyLoss(reduction="none")
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
@@ -282,5 +252,256 @@ class DTrOCRLMHeadModel(nn.Module):
 
         return result
 
-    # The remaining methods (_sample, _beam_search, _get_stopping_criteria, etc.) remain unchanged
-    # as they are already implemented in the provided code.
+    def _sample(
+        self,
+        input_ids: torch.Tensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        **model_kwargs,
+    ) -> torch.Tensor:
+        pad_token_id = generation_config.pad_token_id
+        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+
+        batch_size = input_ids.shape[0]
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+
+        this_peer_finished = False
+        while not this_peer_finished:
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            outputs = self(**model_inputs)
+
+            next_token_logits = outputs.logits[:, -1, :].clone()
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+
+            next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+            if has_eos_stopping_criteria:
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            model_kwargs = self._update_model_kwargs_for_generation(outputs, model_kwargs)
+
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)
+            this_peer_finished = unfinished_sequences.max() == 0
+
+            del outputs
+
+        return input_ids
+
+    def _beam_search(
+        self,
+        input_ids: torch.Tensor,
+        beam_scorer: BeamScorer,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        **model_kwargs,
+    ) -> torch.Tensor:
+        pad_token_id = generation_config.pad_token_id
+        eos_token_id = generation_config.eos_token_id
+
+        batch_size = len(beam_scorer._beam_hyps)
+        num_beams = beam_scorer.num_beams
+
+        batch_beam_size, cur_len = input_ids.shape
+        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+
+        if num_beams * batch_size != batch_beam_size:
+            raise ValueError(
+                f"Batch dimension of `input_ids` should be {num_beams * batch_size}, but is {batch_beam_size}."
+            )
+
+        beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view((batch_size * num_beams,))
+
+        this_peer_finished = False
+        decoder_prompt_len = input_ids.shape[-1]
+        while not this_peer_finished:
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            outputs = self(**model_inputs)
+
+            next_token_logits = outputs.logits[:, -1, :].clone()
+            next_token_scores = nn.functional.log_softmax(
+                next_token_logits, dim=-1
+            )
+
+            next_token_scores_processed = logits_processor(input_ids, next_token_scores)
+            next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(
+                next_token_scores_processed
+            )
+
+            vocab_size = next_token_scores.shape[-1]
+            next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
+
+            n_tokens_to_keep = max(2, 1 + 1) * num_beams
+            next_token_scores, next_tokens = torch.topk(
+                next_token_scores, n_tokens_to_keep, dim=1, largest=True, sorted=True
+            )
+
+            next_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
+            next_tokens = next_tokens % vocab_size
+
+            beam_outputs = beam_scorer.process(
+                input_ids,
+                next_token_scores,
+                next_tokens,
+                next_indices,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                decoder_prompt_len=decoder_prompt_len,
+            )
+
+            beam_scores = beam_outputs["next_beam_scores"]
+            beam_next_tokens = beam_outputs["next_beam_tokens"]
+            beam_idx = beam_outputs["next_beam_indices"]
+
+            input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
+
+            model_kwargs = self._update_model_kwargs_for_generation(outputs, model_kwargs)
+
+            del outputs
+
+            if model_kwargs.get("past_key_values", None) is not None:
+                model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+
+            cur_len = cur_len + 1
+
+            if beam_scorer.is_done or all(stopping_criteria(input_ids, None)):
+                this_peer_finished = True
+
+        sequence_outputs = beam_scorer.finalize(
+            input_ids,
+            beam_scores,
+            next_tokens,
+            next_indices,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            max_length=stopping_criteria.max_length,
+            decoder_prompt_len=decoder_prompt_len,
+        )
+
+        return sequence_outputs["sequences"]
+
+    def _get_stopping_criteria(
+        self,
+        generation_config: GenerationConfig,
+        processor: Optional[DTrOCRProcessor] = None,
+    ) -> StoppingCriteriaList:
+        criteria = StoppingCriteriaList()
+        if generation_config.max_length is not None:
+            max_position_embeddings = getattr(self.config, "max_position_embeddings", None)
+            criteria.append(
+                MaxLengthCriteria(
+                    max_length=generation_config.max_length,
+                    max_position_embeddings=max_position_embeddings,
+                )
+            )
+        if generation_config.max_time is not None:
+            criteria.append(MaxTimeCriteria(max_time=generation_config.max_time))
+        if generation_config.stop_strings is not None:
+            if processor is None:
+                raise ValueError(
+                    "There are one or more stop strings, either in the arguments to `generate` or in the "
+                    "model's generation config, but we could not locate a tokenizer. When generating with "
+                    "stop strings, you must pass the model's tokenizer to the `tokenizer` argument of `generate`."
+                )
+            criteria.append(StopStringCriteria(
+                stop_strings=generation_config.stop_strings, tokenizer=processor.tokeniser)
+            )
+        if generation_config.eos_token_id is not None:
+            criteria.append(EosTokenCriteria(eos_token_id=generation_config.eos_token_id))
+        return criteria
+
+    @staticmethod
+    def _reorder_cache(
+        past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
+    ) -> tuple[tuple[Tensor, ...], ...]:
+        return tuple(
+            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
+            for layer_past in past_key_values
+        )
+
+    @staticmethod
+    def _update_model_kwargs_for_generation(
+        outputs: DTrOCRLMHeadModelOutput,
+        model_kwargs: Dict[str, Any],
+        num_new_tokens: int = 1,
+    ) -> Dict[str, Any]:
+        model_kwargs['past_key_values'] = outputs.past_key_values
+        if "attention_mask" in model_kwargs:
+            attention_mask = model_kwargs["attention_mask"]
+            model_kwargs["attention_mask"] = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
+        if (
+            model_kwargs.get("use_cache", True)
+            and "cache_position" in model_kwargs
+            and model_kwargs["cache_position"] is not None
+        ):
+            model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + num_new_tokens
+        return model_kwargs
+
+    @staticmethod
+    def prepare_inputs_for_generation(
+        input_ids: torch.Tensor, past_key_values=None, **kwargs
+    ) -> Dict[str, Any]:
+        if past_key_values:
+            past_length = past_key_values[0][0].shape[2]
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None)
+
+        if attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1]:]
+        else:
+            position_ids = None
+
+        model_inputs = {
+            'input_ids': input_ids,
+            "past_key_values": past_key_values,
+            'pixel_values': kwargs['pixel_values'],
+            'use_cache': kwargs.get("use_cache"),
+            'labels': kwargs.get("labels"),
+            'attention_mask': attention_mask,
+            'position_ids': position_ids
+        }
+        return model_inputs
+
+    @staticmethod
+    def _get_initial_cache_position(input_ids, model_kwargs):
+        if not model_kwargs.get("use_cache", True):
+            model_kwargs["cache_position"] = None
+            return model_kwargs
+        model_kwargs["cache_position"] = torch.arange(0, input_ids.shape[-1], device=input_ids.device)
+        return model_kwargs
+
+    @staticmethod
+    def _expand_inputs_for_generation(
+        input_ids: Optional[torch.LongTensor],
+        expand_size: int = 1,
+        **model_kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        def _expand_dict_for_generation(dict_to_expand):
+            for key in dict_to_expand:
+                if (
+                    key != "cache_position"
+                    and dict_to_expand[key] is not None
+                    and isinstance(dict_to_expand[key], torch.Tensor)
+                ):
+                    dict_to_expand[key] = dict_to_expand[key].repeat_interleave(expand_size, dim=0)
+            return dict_to_expand
+
+        input_ids = input_ids.repeat_interleave(expand_size, dim=0)
+        model_kwargs = _expand_dict_for_generation(model_kwargs)
+        return input_ids, model_kwargs

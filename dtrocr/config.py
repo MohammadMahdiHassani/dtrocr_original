@@ -1,18 +1,20 @@
 from typing import Optional, Union, Tuple, List, Literal
 
-
 class DTrOCRConfig:
     def __init__(
         self,
         gpt2_hf_model: str = 'openai-community/gpt2',
-        vit_hf_model: str = 'google/vit-base-patch16-224',
+        # --- CHANGE: Updated vision model from ViT to Qwen2-VL-2B-Instruct ---
+        vit_hf_model: str = 'Qwen/Qwen2-VL-2B-Instruct',  # Previously: 'google/vit-base-patch16-224'
         vocab_size: Optional[int] = 50257,
         max_position_embeddings: Optional[int] = 256,
         hidden_size: Optional[int] = 768,
         num_hidden_layers: Optional[int] = 12,
         num_attention_heads: Optional[int] = 12,
-        patch_size: Optional[Union[Tuple[int], List[int]]] = (4, 8),      # (height, width)
-        image_size: Optional[Union[Tuple[int], List[int]]] = (32, 128),   # (height, width)
+        # --- CHANGE: Adjusted patch size to match Qwen2-VL's vision encoder (typically 14x14) ---
+        patch_size: Optional[Union[Tuple[int], List[int]]] = (14, 14),  # Previously: (4, 8)
+        # --- CHANGE: Adjusted image size to be divisible by 14 and suitable for IAM dataset ---
+        image_size: Optional[Union[Tuple[int], List[int]]] = (224, 224),  # Previously: (32, 128)
         num_channels: Optional[int] = 3,
         resid_pdrop: Optional[float] = 0.1,
         embd_pdrop: Optional[float] = 0.1,
@@ -36,7 +38,7 @@ class DTrOCRConfig:
         self.layer_norm_epsilon = layer_norm_epsilon
         self._attn_implementation = attn_implementation
 
-        # other GPT2 config values
+        # Other GPT2 config values
         self.n_inner = None
         self.scale_attn_weights = True
         self.scale_attn_by_inverse_layer_idx = False
