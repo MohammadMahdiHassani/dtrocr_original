@@ -4,16 +4,16 @@ class DTrOCRConfig:
     def __init__(
         self,
         gpt2_hf_model: str = 'openai-community/gpt2',
-        # --- CHANGE: Updated vision model from ViT to Qwen2-VL-2B-Instruct ---
-        vit_hf_model: str = 'Qwen/Qwen2-VL-2B-Instruct',  # Previously: 'google/vit-base-patch16-224'
+        # --- CHANGE: Updated vision model from ViT to facebook/dino-vitb16 ---
+        vit_hf_model: str = 'facebook/dino-vitb16',  # Previously: 'google/vit-base-patch16-224'
         vocab_size: Optional[int] = 50257,
         max_position_embeddings: Optional[int] = 256,
         hidden_size: Optional[int] = 768,
         num_hidden_layers: Optional[int] = 12,
         num_attention_heads: Optional[int] = 12,
-        # --- CHANGE: Adjusted patch size to match Qwen2-VL's vision encoder (typically 14x14) ---
-        patch_size: Optional[Union[Tuple[int], List[int]]] = (14, 14),  # Previously: (4, 8)
-        # --- CHANGE: Adjusted image size to be divisible by 14 and suitable for IAM dataset ---
+        # --- CHANGE: Adjusted patch size to match DINO's default (16x16) ---
+        patch_size: Optional[Union[Tuple[int], List[int]]] = (16, 16),  # Previously: (4, 8)
+        # --- CHANGE: Adjusted image size to 224x224 for DINO compatibility ---
         image_size: Optional[Union[Tuple[int], List[int]]] = (224, 224),  # Previously: (32, 128)
         num_channels: Optional[int] = 3,
         resid_pdrop: Optional[float] = 0.1,

@@ -1,4 +1,4 @@
-from transformers import GPT2Tokenizer, AutoProcessor
+from transformers import GPT2Tokenizer, AutoImageProcessor
 from PIL import Image
 from typing import List, Union
 from config import DTrOCRConfig
@@ -6,8 +6,8 @@ from data import DTrOCRProcessorOutput
 
 class DTrOCRProcessor:
     def __init__(self, config: DTrOCRConfig, add_bos_token: bool = False, add_eos_token: bool = False):
-        # --- CHANGE: Use Qwen2-VL's AutoProcessor instead of AutoImageProcessor ---
-        self.vit_processor = AutoProcessor.from_pretrained(
+        # --- CHANGE: Use DINO's AutoImageProcessor ---
+        self.vit_processor = AutoImageProcessor.from_pretrained(
             config.vit_hf_model,
             size={
                 "height": config.image_size[0],
@@ -41,9 +41,8 @@ class DTrOCRProcessor:
             texts, padding=padding, *args, **kwargs
         ) if texts is not None else None
 
-        # --- CHANGE: Ensure Qwen2-VL processor handles image input correctly ---
         image_inputs = self.vit_processor(
-            images, return_tensors="pt", padding=True, *args, **kwargs
+            images, return_tensors="pt", *args, **kwargs
         ) if images is not None else None
 
         return DTrOCRProcessorOutput(

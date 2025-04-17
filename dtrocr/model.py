@@ -6,8 +6,8 @@ from config import DTrOCRConfig
 from processor import DTrOCRProcessor
 from data import DTrOCRLMHeadModelOutput, DTrOCRModelOutput, DTrOCRProcessorOutput
 
-# --- CHANGE: Import Qwen2-VL instead of ViT ---
-from transformers import Qwen2VLForConditionalGeneration
+# --- CHANGE: Import DINO model instead of ViT ---
+from transformers import ViTModel  # DINO uses ViTModel as its base
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.configuration_utils import GenerationConfig
@@ -24,13 +24,9 @@ from transformers.generation.stopping_criteria import (
 class DTrOCRModel(nn.Module):
     def __init__(self, config: DTrOCRConfig):
         super().__init__()
-        # --- CHANGE: Replace ViTPatchEmbeddings with Qwen2-VL vision encoder ---
-        qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(config.vit_hf_model)
-        self.patch_embeddings = qwen_model.vision_tower  # Extract the vision encoder (ViT-based)
-        self.vision_output_dim = 1152  # Qwen2-VL-2B's vision encoder output dimension (from model config)
-
-        # Add a projection layer to match GPT-2's hidden size
-        self.projection = nn.Linear(self.vision_output_dim, config.hidden_size)
+        # --- CHANGE: Replace ViTPatchEmbeddings with DINO ViT-B/16 ---
+        self.patch_embeddings = ViTModel.from_pretrained(config.vit_hf_model)
+        # DINO ViT-B/16 outputs 768-dim embeddings, matching GPT-2's hidden_size, so no projection layer needed
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.positional_embedding = nn.Embedding(config.max_position_embeddings, config.hidden_size)
@@ -60,12 +56,13 @@ class DTrOCRModel(nn.Module):
         else:
             past_length = past_key_values[0][0].size(-2)
 
-        # --- CHANGE: Process pixel values with Qwen2-VL vision encoder ---
+        # --- CHANGE: Process pixel values with DINO ViT-B/16 ---
         if past_length == 0:
             with torch.no_grad():  # Freeze vision encoder
-                patch_embeddings = self.patch_embeddings(pixel_values)  # Shape: (batch, num_patches, vision_output_dim)
-            # Project to GPT-2's hidden size
-            patch_embeddings = self.projection(patch_embeddings)  # Shape: (batch, num_patches, hidden_size)
+                dino_outputs = self.patch_embeddings(pixel_values)
+                patch_embeddings = dino_outputs.last_hidden_state  # Shape: (batch, num_patches + 1, 768)
+                # Remove the [CLS] token (first token), keep only patch embeddings
+                patch_embeddings = patch_embeddings[:, 1:, :]  # Shape: (batch, 196, 768)
         else:
             patch_embeddings = None
 
