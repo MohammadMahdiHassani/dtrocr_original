@@ -6,8 +6,8 @@ from config import DTrOCRConfig
 from processor import DTrOCRProcessor
 from data import DTrOCRLMHeadModelOutput, DTrOCRModelOutput, DTrOCRProcessorOutput
 
-# --- CHANGE: Import DINO model instead of ViT ---
-from transformers import ViTModel  # DINO uses ViTModel as its base
+# --- CHANGE: Import Florence-2 model ---
+from transformers import AutoModelForCausalLM
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.configuration_utils import GenerationConfig
@@ -24,9 +24,15 @@ from transformers.generation.stopping_criteria import (
 class DTrOCRModel(nn.Module):
     def __init__(self, config: DTrOCRConfig):
         super().__init__()
-        # --- CHANGE: Replace ViTPatchEmbeddings with DINO ViT-B/16 ---
-        self.patch_embeddings = ViTModel.from_pretrained(config.vit_hf_model)
-        # DINO ViT-B/16 outputs 768-dim embeddings, matching GPT-2's hidden_size, so no projection layer needed
+        # --- CHANGE: Load Florence-2's vision encoder ---
+        florence_model = AutoModelForCausalLM.from_pretrained(
+            config.vit_hf_model,
+            trust_remote_code=True,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        )
+        self.patch_embeddings = florence_model.vision_tower  # Extract DaViT vision encoder
+        # Florence-2's DaViT outputs 1024-dim embeddings, need to project to 768 for GPT-2
+        self.projection = nn.Linear(1024, config.hidden_size)
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.positional_embedding = nn.Embedding(config.max_position_embeddings, config.hidden_size)
@@ -56,13 +62,14 @@ class DTrOCRModel(nn.Module):
         else:
             past_length = past_key_values[0][0].size(-2)
 
-        # --- CHANGE: Process pixel values with DINO ViT-B/16 ---
+        # --- CHANGE: Process pixel values with Florence-2's vision encoder ---
         if past_length == 0:
             with torch.no_grad():  # Freeze vision encoder
-                dino_outputs = self.patch_embeddings(pixel_values)
-                patch_embeddings = dino_outputs.last_hidden_state  # Shape: (batch, num_patches + 1, 768)
-                # Remove the [CLS] token (first token), keep only patch embeddings
-                patch_embeddings = patch_embeddings[:, 1:, :]  # Shape: (batch, 196, 768)
+                vision_outputs = self.patch_embeddings(pixel_values)
+                # Florence-2's vision_tower returns a tuple, take the first element (features)
+                patch_embeddings = vision_outputs[0]  # Shape: (batch, num_patches, 1024)
+                # Project to GPT-2's hidden size (768)
+                patch_embeddings = self.projection(patch_embeddings)  # Shape: (batch, num_patches, 768)
         else:
             patch_embeddings = None
 
@@ -466,7 +473,7 @@ class DTrOCRLMHeadModel(nn.Module):
 
         model_inputs = {
             'input_ids': input_ids,
-            "past_key_values": past_key_values,
+            "past_key值的": past_key_values,
             'pixel_values': kwargs['pixel_values'],
             'use_cache': kwargs.get("use_cache"),
             'labels': kwargs.get("labels"),

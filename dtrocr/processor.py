@@ -1,4 +1,4 @@
-from transformers import GPT2Tokenizer, AutoImageProcessor
+from transformers import GPT2Tokenizer, AutoProcessor
 from PIL import Image
 from typing import List, Union
 from config import DTrOCRConfig
@@ -6,9 +6,10 @@ from data import DTrOCRProcessorOutput
 
 class DTrOCRProcessor:
     def __init__(self, config: DTrOCRConfig, add_bos_token: bool = False, add_eos_token: bool = False):
-        # --- CHANGE: Use DINO's AutoImageProcessor ---
-        self.vit_processor = AutoImageProcessor.from_pretrained(
+        # --- CHANGE: Use Florence-2's AutoProcessor ---
+        self.vit_processor = AutoProcessor.from_pretrained(
             config.vit_hf_model,
+            trust_remote_code=True,
             size={
                 "height": config.image_size[0],
                 "width": config.image_size[1]
@@ -41,8 +42,13 @@ class DTrOCRProcessor:
             texts, padding=padding, *args, **kwargs
         ) if texts is not None else None
 
+        # --- CHANGE: Florence-2 processor requires a dummy text input for image processing ---
         image_inputs = self.vit_processor(
-            images, return_tensors="pt", *args, **kwargs
+            text="<OCR>",  # Dummy prompt for image processing
+            images=images,
+            return_tensors="pt",
+            *args,
+            **kwargs
         ) if images is not None else None
 
         return DTrOCRProcessorOutput(
